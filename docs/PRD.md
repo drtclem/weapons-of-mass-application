@@ -1,6 +1,6 @@
 # Weapons of Mass Application — PRD (hackathon MVP)
 
-Version 1.0 · 2026-11-06 · Owner: Andre Batista
+Version 1.1 · 2026-11-06 · Owner: Andre Batista
 
 ## 1. Summary
 
@@ -53,7 +53,8 @@ This document describes the hackathon MVP of a multi-tenant SaaS. It records dec
 | Decision engine | One LLM judgment per posting, informed by the profile and survey. No hard-coded filters. |
 | Pay data | Posted salary ranges on the job, plus levels.fyi for comparables. |
 | Interview booking | Only after the user confirms a specific day and time. |
-| Board stages | Found, Applied, Interviewing, Offer, Closed. |
+| Board stages | Applied, Interviewing, Offer, Closed. There is no Found stage and no stored queue. |
+| Daily run | Query, rank, apply to the top N, store only what was applied to. Postings the agent skipped are not stored. |
 | Status | Status is a column on the application row, not an event log. A separate activity log records what the agent did. |
 | Learning | Outcomes are logged; nothing is learned from them yet. |
 
@@ -106,15 +107,16 @@ These are reversible. Each one changes a bounded part of the system.
 
 - Sources: Ashby, Greenhouse and Lever public board APIs; HN "Who is hiring" monthly thread; LinkedIn public job search as best-effort.
 - Company list per user: generated from the profile by the LLM, resolved to ATS board slugs, cached, and grown over time. Users can add or remove companies.
-- Dedupe postings by (ATS, company, job id) and by normalized URL. A posting is judged once per user.
-- Each discovered posting becomes a JOB row with a FOUND application row for the user.
+- Discovery is stateless. Each run fetches current postings, drops any that already have an application row for this user (matched by ATS job id or normalized URL), and hands the rest to the decision step. Postings that are skipped are not stored and may be judged again on a later run.
+- A JOB row is written only when the agent starts an application for it.
 
 ### 7.3 Decision
 
 - Input: the posting (title, description, location, posted pay range), the profile, the survey.
-- Output: `apply: true|false`, a short rationale, and the key facts extracted from the posting (pay range, location mode, seniority).
+- Output per posting: `apply: true|false`, a short rationale, and the key facts extracted from the posting (pay range, location mode, seniority, application deadline if stated).
 - One LLM call per posting. Deterministic prompt, versioned so decisions are comparable across prompt changes.
-- Daily target: the agent applies to the first N approved postings per day where N is the user's configured target (default 12, range 1–30).
+- Ranking: approved postings are ordered by the model with fit first and stated deadlines as a tiebreaker, so a posting closing today is not lost to tomorrow's run. The prompt carries the deadline rule; there is no separate scheduler.
+- Daily target: the agent applies to the top N of that ranked list, where N is the user's configured target (default 12, range 1–30). The rest are discarded, not queued.
 
 ### 7.4 Resume tailoring
 
@@ -128,7 +130,8 @@ These are reversible. Each one changes a bounded part of the system.
 - Standard fields are mapped. Free-text questions are answered by the LLM from the profile, capped in length, and stored with the application so the user can see what was said.
 - Voluntary self-identification sections are skipped.
 - If the ATS requires an account, the agent creates one with the user's Gmail address and a generated password, stores the credential in the vault, and reads the verification email through Gmail.
-- Submission is confirmed by the ATS confirmation page or email; status moves to APPLIED with the timestamp. A failure leaves the row at FOUND with an error recorded in the activity log, and the posting is retried once the next day.
+- Submission is confirmed by the ATS confirmation page or email; status moves to APPLIED with the timestamp.
+- A submission that fails or is parked on a CAPTCHA is stored as PENDING with the error in the activity log, so it is retried once on the next run and is not re-judged. PENDING is the only in-flight state; it is shown inside the Applied column with a badge, not as its own lane.
 
 ### 7.6 CAPTCHA escalation chain
 
@@ -155,7 +158,7 @@ Every escalation is recorded in the activity log with which stage resolved it.
 
 ### 7.9 Dashboard
 
-- Kanban board with columns Found, Applied, Interviewing, Offer, Closed. Each card shows company, title, location mode, posted pay range, date applied, and last activity.
+- Kanban board with columns Applied, Interviewing, Offer, Closed. Pending submissions appear in Applied with a badge. Each card shows company, title, location mode, posted pay range, date applied, and last activity.
 - Card detail shows the tailored resume, the answers given on the form, the email thread, the activity log, and the prep plan when one exists.
 - The user can drag cards between columns. A card in Closed receives no further agent action.
 - Interview feedback intake form linked from each Interviewing card.
@@ -182,8 +185,8 @@ All tables carry `tenant_id`. Status is a column, not an event stream.
 - **users**: id, tenant_id, email, google tokens (encrypted), digest hour, daily target.
 - **profiles**: user_id, document (jsonb), approved_at, version.
 - **companies**: id, name, ats (ashby | greenhouse | lever), board_slug, source, created_by (llm | user | hn).
-- **jobs**: id, company_id, ats_job_id, title, url, description, location, location_mode (onsite | hybrid | remote), pay_min, pay_max, posted_at, raw (jsonb). Unique on (ats, ats_job_id).
-- **applications**: id, user_id, job_id, status (found | applied | interviewing | offer | closed), decision (jsonb: apply, rationale), resume_pdf_ref, form_answers (jsonb), applied_at, closed_reason, last_activity_at.
+- **jobs** (written only when an application starts): id, company_id, ats_job_id, title, url, description, location, location_mode (onsite | hybrid | remote), pay_min, pay_max, posted_at, raw (jsonb). Unique on (ats, ats_job_id).
+- **applications**: id, user_id, job_id, status (pending | applied | interviewing | offer | closed), decision (jsonb: apply, rationale), resume_pdf_ref, form_answers (jsonb), applied_at, closed_reason, last_activity_at.
 - **ats_credentials**: user_id, ats, company_id, username, password_ciphertext, created_at.
 - **email_threads**: application_id, gmail_thread_id, kind (confirmation | rejection | interview | offer | other), last_message_at.
 - **interviews**: application_id, proposed_slots (jsonb), confirmed_at, starts_at, ends_at, calendar_event_id, prep_plan (text), feedback (jsonb).
@@ -192,7 +195,7 @@ All tables carry `tenant_id`. Status is a column, not an event stream.
 
 ## 9. Architecture
 
-- **Droplet** running: a web app (board, profile review, intake forms), an API, Postgres, a job queue, and Playwright workers.
+- **Droplet** running: a web app (board, profile review, intake forms), an API, Postgres, a task queue for the workers (not an application queue), and Playwright workers.
 - **Scheduler** triggers a discovery and application run per user daily and a mail-sync run hourly.
 - **LLM** calls for profile building, company list generation, decision, tailoring, form answers, CAPTCHA attempts, scheduling email parsing, prep plans. Each call type has a versioned prompt.
 - **Secrets**: Google tokens and ATS passwords encrypted at rest with a per-tenant key.
@@ -215,7 +218,7 @@ Home-folder scan and CLI, learning loop, pairwise comparison, logged-in LinkedIn
 ## 12. Demo plan
 
 1. Sign in as the demo user; show connected sources and the approved profile.
-2. Trigger a run. Watch cards appear in Found with rationale, then move to Applied with the tailored resume attached.
+2. Trigger a run. The run view lists the day's ranked candidates with rationales as they are processed; cards appear in Applied with the tailored resume attached. The run view is ephemeral and is not a stored queue.
 3. Show one application that hit a CAPTCHA and the chain that resolved it.
 4. The simulated recruiter replies with times. The user's inbox shows the confirmation email; click one slot.
 5. The card moves to Interviewing; the calendar event and prep plan appear.
@@ -224,7 +227,8 @@ Home-folder scan and CLI, learning loop, pairwise comparison, logged-in LinkedIn
 ## 13. Acceptance criteria
 
 - A new user can sign in, upload a resume, complete the survey, and approve a profile in under 10 minutes.
-- A run against seeded boards produces at least 10 Found cards with rationales and at least 5 Applied cards with PDFs and recorded form answers.
+- A run against seeded boards shows at least 10 ranked candidates with rationales in the run view and produces at least 5 Applied cards with PDFs and recorded form answers.
+- A second run on the same day produces no duplicate applications.
 - A seeded CAPTCHA is resolved by stage 1 or 2 at least once in the demo, and the human path works when both fail.
 - A recruiter reply with proposed times results in a confirmation email to the user, and confirming a slot creates a calendar event and a reply to the recruiter, with nothing sent before the click.
 - No outgoing email in the demo contains a dollar sign or the words salary, compensation or equity.
